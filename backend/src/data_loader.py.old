@@ -1,0 +1,256 @@
+# 
+
+import pandas as pd
+import os
+from functools import lru_cache
+
+class SalesDataManager:
+    """Manages sales data with efficient loading and caching"""
+    
+    def __init__(self, csv_path=None, chunk_size=10000):
+        self.csv_path = csv_path
+        self.chunk_size = chunk_size
+        self.total_records = 0
+        self.unique_values = {}
+        self._load_metadata()
+    
+    def _find_csv_path(self):
+        """Find the CSV file in possible locations"""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        possible_paths = [
+            os.path.join(script_dir, '..', 'sales_data.csv'),
+            os.path.join(script_dir, '..', '..', 'sales_data.csv'),
+            'sales_data.csv',
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                print(f"✓ Found CSV at: {os.path.abspath(path)}")
+                return path
+        
+        print(f"✗ CSV not found. Searched in:")
+        for path in possible_paths:
+            print(f"  - {os.path.abspath(path)}")
+        return None
+    
+    def _load_metadata(self):
+        """Load metadata and unique values without loading all data"""
+        if self.csv_path is None:
+            self.csv_path = self._find_csv_path()
+        
+        if self.csv_path is None:
+            return
+        
+        try:
+            # Read first chunk to get column info and count total rows
+            df_sample = pd.read_csv(self.csv_path, nrows=1000)
+            
+            # Clean column names
+            df_sample.columns = df_sample.columns.str.strip().str.lower().str.replace(' ', '_')
+            
+            # Count total rows efficiently
+            with open(self.csv_path, 'r', encoding='utf-8') as f:
+                self.total_records = sum(1 for _ in f) - 1  # -1 for header
+            
+            print(f"✓ Total records in CSV: {self.total_records:,}")
+            
+            # Load unique values from a sample (first 10k rows for speed)
+            df_unique = pd.read_csv(self.csv_path, nrows=10000)
+            df_unique.columns = df_unique.columns.str.strip().str.lower().str.replace(' ', '_')
+            
+            self.unique_values = {
+                'customer_regions': sorted([x for x in df_unique['customer_region'].unique() if pd.notna(x) and x]) if 'customer_region' in df_unique.columns else [],
+                'genders': sorted([x for x in df_unique['gender'].unique() if pd.notna(x) and x]) if 'gender' in df_unique.columns else [],
+                'product_categories': sorted([x for x in df_unique['product_category'].unique() if pd.notna(x) and x]) if 'product_category' in df_unique.columns else [],
+                'payment_methods': sorted([x for x in df_unique['payment_method'].unique() if pd.notna(x) and x]) if 'payment_method' in df_unique.columns else [],
+                'tags': sorted(list(set(tag.strip() for sublist in df_unique['tags'].dropna().str.split(',') for tag in sublist if tag.strip()))) if 'tags' in df_unique.columns else []
+            }
+            
+            print(f"✓ Loaded filter options from sample data")
+            
+        except Exception as e:
+            print(f"✗ Error loading metadata: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    @lru_cache(maxsize=100)
+    def load_chunk(self, skip_rows=0, nrows=50):
+        """Load a specific chunk of data with caching"""
+        if self.csv_path is None:
+            return []
+        
+        try:
+            # Skip header + skip_rows, then read nrows
+            if skip_rows == 0:
+                df = pd.read_csv(self.csv_path, nrows=nrows)
+            else:
+                df = pd.read_csv(self.csv_path, skiprows=range(1, skip_rows + 1), nrows=nrows)
+            
+            # Clean column names
+            df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+            
+            # Handle missing values
+            df = df.fillna('')
+            
+            # Convert date column
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'], format='%d-%m-%Y', errors='coerce')
+                df['date'] = df['date'].dt.strftime('%Y-%m-%d')
+            
+            # Convert numeric columns
+            numeric_columns = ['age', 'quantity', 'price_per_unit', 'discount_percentage', 'total_amount', 'final_amount']
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            return df.to_dict('records')
+            
+        except Exception as e:
+            print(f"✗ Error loading chunk (skip={skip_rows}, nrows={nrows}): {str(e)}")
+            return []
+    
+    def search_and_filter(self, filters=None, search_text="", page=1, page_size=50, sort_by="date"):
+        """
+        Search and filter data efficiently by loading only required chunks
+        For large datasets, this loads data in chunks and filters on-the-fly
+        """
+        if self.csv_path is None:
+            return {
+                'data': [],
+                'total': 0,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': 0
+            }
+        
+        filters = filters or {}
+        
+        # For simplicity with 1M records, load in larger chunks and filter
+        # This is a trade-off: we load more data but filter efficiently
+        chunk_size = 5000  # Load 5k at a time
+        matched_records = []
+        chunks_processed = 0
+        max_chunks_to_process = 200  # Process up to 1M records (200 * 5000)
+        
+        try:
+            for chunk_start in range(0, min(self.total_records, max_chunks_to_process * chunk_size), chunk_size):
+                chunk_data = self.load_chunk(skip_rows=chunk_start, nrows=chunk_size)
+                
+                # Filter this chunk
+                for record in chunk_data:
+                    if self._matches_filters(record, filters, search_text):
+                        matched_records.append(record)
+                
+                chunks_processed += 1
+                
+                # Early exit if we have enough data for pagination
+                # Load at least enough to fill current page + next page
+                if len(matched_records) >= (page + 1) * page_size:
+                    break
+            
+            # Apply sorting
+            matched_records = self._sort_records(matched_records, sort_by)
+            
+            # Paginate
+            total_items = len(matched_records)
+            total_pages = (total_items + page_size - 1) // page_size if total_items > 0 else 0
+            start_idx = (page - 1) * page_size
+            end_idx = start_idx + page_size
+            paginated_data = matched_records[start_idx:end_idx]
+            
+            return {
+                'data': paginated_data,
+                'total': total_items,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': total_pages,
+                'chunks_processed': chunks_processed,
+                'filters': filters,
+                'search': search_text,
+                'sort_by': sort_by
+            }
+            
+        except Exception as e:
+            print(f"✗ Error in search_and_filter: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return {
+                'data': [],
+                'total': 0,
+                'page': page,
+                'page_size': page_size,
+                'total_pages': 0,
+                'error': str(e)
+            }
+    
+    def _matches_filters(self, record, filters, search_text):
+        """Check if a record matches all filters"""
+        # Search filter
+        if search_text:
+            search_text = search_text.lower()
+            if not (search_text in str(record.get('customer_name', '')).lower() or
+                    search_text in str(record.get('phone_number', '')).lower()):
+                return False
+        
+        # Multi-select filters
+        for field in ['customer_region', 'gender', 'product_category', 'payment_method']:
+            if field in filters and filters[field]:
+                if str(record.get(field, '')).strip() not in filters[field]:
+                    return False
+        
+        # Tags filter
+        if 'tags' in filters and filters['tags']:
+            record_tags = str(record.get('tags', '')).split(',')
+            if not any(tag in record_tags for tag in filters['tags']):
+                return False
+        
+        # Age range
+        if 'age_min' in filters and filters['age_min'] is not None:
+            if not isinstance(record.get('age'), (int, float)) or record.get('age', 0) < filters['age_min']:
+                return False
+        
+        if 'age_max' in filters and filters['age_max'] is not None:
+            if not isinstance(record.get('age'), (int, float)) or record.get('age', 100) > filters['age_max']:
+                return False
+        
+        # Date range
+        if 'date_start' in filters and filters['date_start']:
+            if not record.get('date') or record.get('date') < filters['date_start']:
+                return False
+        
+        if 'date_end' in filters and filters['date_end']:
+            if not record.get('date') or record.get('date') > filters['date_end']:
+                return False
+        
+        return True
+    
+    def _sort_records(self, records, sort_by):
+        """Sort records by specified field"""
+        try:
+            if sort_by == 'date':
+                return sorted(records, key=lambda x: x.get('date', ''), reverse=True)
+            elif sort_by == 'quantity':
+                return sorted(records, key=lambda x: x.get('quantity', 0) if isinstance(x.get('quantity'), (int, float)) else 0, reverse=True)
+            elif sort_by == 'customer_name':
+                return sorted(records, key=lambda x: str(x.get('customer_name', '')).lower())
+            return records
+        except Exception as e:
+            print(f"✗ Error sorting: {e}")
+            return records
+
+
+# Global instance
+sales_manager = None
+
+def get_sales_manager():
+    """Get or create the global sales manager instance"""
+    global sales_manager
+    if sales_manager is None:
+        sales_manager = SalesDataManager()
+    return sales_manager
+
+def load_sales_data():
+    """Legacy function for compatibility"""
+    manager = get_sales_manager()
+    return [], manager.unique_values
