@@ -6,7 +6,7 @@ A full-stack web application for managing retail sales data with advanced search
 ## Tech Stack
 - **Backend**: FastAPI (Python)
 - **Frontend**: React
-- **Data Storage**: CSV file
+- **Data Storage**: DB MongoDB
 - **API Communication**: RESTful API
 
 ## Search Implementation
